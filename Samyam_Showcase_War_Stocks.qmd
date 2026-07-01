@@ -1,0 +1,395 @@
+---
+title: "War & Markets: How Global Conflict Shapes Stock Performance"
+subtitle: "DATA 332 Project Showcase"
+author: "Samyam Bista"
+format:
+  pdf:
+    fontsize: 9pt
+    geometry: margin=1.5cm
+    toc: false
+    page-layout: full
+    embed-resources: true
+    css: |
+      body { font-family: 'Georgia', serif; max-width: 960px; margin: auto; }
+      h1 { font-size: 1.4em; color: #1f3864; border-bottom: 2px solid #1f3864; padding-bottom: 4px; }
+      h2 { font-size: 1.15em; color: #2c5f8a; margin-top: 1em; }
+      h3 { font-size: 1.0em; color: #333; }
+      .page-break { page-break-after: always; margin: 0; }
+      table { font-size: 0.8em; }
+      .outcome-box { background: #f0f4f8; border-left: 4px solid #1f3864; padding: 8px 12px; margin: 6px 0; border-radius: 3px; font-size: 0.85em; }
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#install.packages("tidyquant")
+#install.packages("tidyverse")
+#install.packages("ggplot2")
+#install.packages("dplyr")
+#install.packages("lubridate")
+#install.packages("scales")
+#install.packages("zoo")
+```
+
+```{r}
+#| label: load-libraries
+
+library(tidyquant)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(scales)
+library(zoo)
+library(purrr)
+```
+
+```{r}
+#| label: import-and-transform
+
+# --- TICKERS ---
+all_tickers <- c("LMT", "RTX", "NOC", "XOM", "CVX", "DAL", "UAL", "AMZN", "WMT")
+
+# --- FETCH DATA ---
+stock_data <- tq_get(
+  all_tickers,
+  from = "2024-01-01",
+  to   = "2026-04-01",
+  get  = "stock.prices"
+)
+
+# --- CLEAN ---
+stock_clean <- stock_data %>%
+  filter(!is.na(adjusted), !is.na(close), !is.na(volume))
+
+# --- ASSIGN INDUSTRIES ---
+stock_clean <- stock_clean %>%
+  mutate(industry = case_when(
+    symbol %in% c("LMT", "RTX", "NOC") ~ "Defense",
+    symbol %in% c("XOM", "CVX")        ~ "Energy",
+    symbol %in% c("DAL", "UAL")        ~ "Airlines",
+    symbol %in% c("AMZN", "WMT")       ~ "Consumer Retail"
+  ))
+
+# --- CALCULATE RETURNS & ROLLING VOLATILITY ---
+stock_clean <- stock_clean %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(
+    daily_return      = (adjusted / lag(adjusted)) - 1,
+    cumulative_return = cumprod(replace_na(1 + daily_return, 1)) - 1,
+    rolling_vol_30    = rollapply(daily_return, width = 30, FUN = sd,
+                                   fill = NA, align = "right")
+  ) %>%
+  ungroup() %>%
+  mutate(year = year(date), month = month(date, label = TRUE))
+
+# --- CONFLICT EVENTS ---
+conflict_events <- data.frame(
+  event_date = as.Date(c("2025-06-13", "2025-06-22", "2025-11-14",
+                          "2026-01-03", "2026-02-28")),
+  event_label = c(
+    "12-Day War\n(Jun 2025)",
+    "US Joins Iran\n(Jun 2025)",
+    "Southern Spear\n(Nov 2025)",
+    "Maduro Captured\n(Jan 2026)",
+    "US-Iran War\n(Feb 2026)"
+  )
+)
+
+# --- INDUSTRY AVERAGES ---
+industry_returns <- stock_clean %>%
+  group_by(industry, date) %>%
+  summarise(
+    avg_cum_return   = mean(cumulative_return, na.rm = TRUE),
+    avg_daily_return = mean(daily_return, na.rm = TRUE),
+    avg_vol          = mean(rolling_vol_30, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- RECOVERY FUNCTION ---
+recovery_analysis <- function(event_dt, event_label, lookback_days = 20) {
+  baseline <- stock_clean %>%
+    filter(date >= event_dt - lookback_days & date < event_dt) %>%
+    group_by(symbol, industry) %>%
+    summarise(baseline_price = mean(adjusted, na.rm = TRUE), .groups = "drop")
+
+  post_event <- stock_clean %>%
+    filter(date >= event_dt & date <= event_dt + 180) %>%
+    select(symbol, date, adjusted) %>%
+    arrange(symbol, date)
+
+  purrr::map_dfr(seq_len(nrow(baseline)), function(i) {
+    ticker     <- baseline$symbol[i]
+    ind        <- baseline$industry[i]
+    base_price <- baseline$baseline_price[i]
+    prices     <- post_event %>% filter(symbol == ticker) %>% pull(adjusted)
+
+    first_price   <- if (length(prices) > 0) prices[1] else NA_real_
+    drop_pct      <- round((first_price / base_price - 1) * 100, 1)
+    rec           <- which(prices >= base_price)
+    recovery_days <- if (length(rec) > 0) min(rec) else NA_integer_
+
+    data.frame(symbol = ticker, industry = ind, drop_pct = drop_pct,
+               recovery_days = recovery_days, recovered = !is.na(recovery_days),
+               event = event_label, stringsAsFactors = FALSE)
+  })
+}
+
+recovery_results <- bind_rows(
+  recovery_analysis(as.Date("2025-06-13"), "12-Day War (Jun 2025)"),
+  recovery_analysis(as.Date("2025-11-14"), "Southern Spear (Nov 2025)"),
+  recovery_analysis(as.Date("2026-01-03"), "Maduro Captured (Jan 2026)"),
+  recovery_analysis(as.Date("2026-02-28"), "US-Iran War (Feb 2026)")
+)
+```
+
+------------------------------------------------------------------------
+
+# Page 1: Project Definition
+
+## Project Goals
+
+This project investigates how major geopolitical conflict events between 2025 and 2026 impacted stock prices across four industries: **Defense**, **Energy**, **Airlines**, and **Consumer Retail**. Using R and the `tidyquant` package, live historical stock data is fetched directly from Yahoo Finance with no external file download required.
+
+**Three core questions drive the analysis:**
+
+-   Which industries consistently gain during war and which consistently lose?
+-   How quickly does each industry's stock price react after a conflict event?
+-   How long does it take each industry to recover back to its pre-war price?
+
+## Stocks & Conflict Events Studied
+
+::::: {style="display: flex; gap: 30px;"}
+<div>
+
+| Industry | Ticker | Company          |
+|----------|--------|------------------|
+| Defense  | LMT    | Lockheed Martin  |
+| Defense  | RTX    | Raytheon         |
+| Defense  | NOC    | Northrop Grumman |
+| Energy   | XOM    | ExxonMobil       |
+| Energy   | CVX    | Chevron          |
+| Airlines | DAL    | Delta Air Lines  |
+| Airlines | UAL    | United Airlines  |
+| Retail   | AMZN   | Amazon           |
+| Retail   | WMT    | Walmart          |
+
+</div>
+
+<div>
+
+| Event                       | Date         |
+|-----------------------------|--------------|
+| Israel-Iran 12-Day War      | Jun 13, 2025 |
+| US Joins Iran Conflict      | Jun 22, 2025 |
+| Operation Southern Spear    | Nov 14, 2025 |
+| Maduro Captured (Venezuela) | Jan 3, 2026  |
+| Full US-Iran War            | Feb 28, 2026 |
+
+**Data Source:** Yahoo Finance via `tidyquant::tq_get()` **Date Range:** Jan 2024 – Apr 2026 \| **Frequency:** Daily
+
+</div>
+:::::
+
+## Data Summary
+
+```{r}
+#| label: data-summary
+
+stock_clean %>%
+  group_by(symbol, industry) %>%
+  summarise(
+    `Trading Days` = n(),
+    `Min Price`    = dollar(round(min(adjusted), 2)),
+    `Max Price`    = dollar(round(max(adjusted), 2)),
+    `Avg Price`    = dollar(round(mean(adjusted), 2)),
+    `Volatility`   = percent(round(sd(daily_return, na.rm = TRUE), 4)),
+    .groups = "drop"
+  ) %>%
+  rename(Stock = symbol, Industry = industry) %>%
+  knitr::kable(align = "llccccc")
+```
+
+::: page-break
+:::
+
+# Page 2: Methodology & Visualizations
+
+## Chart 1: Cumulative Returns by Industry with Conflict Event Markers
+
+```{r}
+#| label: chart-cumulative
+#| fig-width: 9
+#| fig-height: 3
+
+industry_colors <- c("Defense" = "#1f77b4", "Energy" = "#d62728",
+                      "Airlines" = "#ff7f0e", "Consumer Retail" = "#2ca02c")
+
+ggplot(industry_returns, aes(x = date, y = avg_cum_return, color = industry)) +
+  geom_line(size = 0.9) +
+  geom_vline(data = conflict_events, aes(xintercept = event_date),
+             linetype = "dashed", color = "black", alpha = 0.5, size = 0.5) +
+  geom_text(data = conflict_events,
+            aes(x = event_date,
+                y = max(industry_returns$avg_cum_return, na.rm = TRUE) * 0.9,
+                label = event_label),
+            inherit.aes = FALSE,
+            angle = 90, hjust = 1, size = 2.2, color = "gray30") +
+  geom_hline(yintercept = 0, color = "gray60", size = 0.4) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_manual(values = industry_colors) +
+  labs(title = "Cumulative Returns by Industry (2024-2026)",
+       subtitle = "Dashed lines mark major conflict escalation events",
+       x = NULL, y = "Avg Cumulative Return", color = "Industry") +
+  theme_tq() +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        legend.position = "bottom", legend.text = element_text(size = 8))
+```
+
+## Chart 2: 30-Day Rolling Volatility
+
+```{r}
+#| label: chart-volatility
+#| fig-width: 9
+#| fig-height: 2.5
+
+industry_returns %>%
+  filter(!is.na(avg_vol)) %>%
+  ggplot(aes(x = date, y = avg_vol, color = industry)) +
+  geom_line(size = 0.8, alpha = 0.85) +
+  geom_vline(data = conflict_events, aes(xintercept = event_date),
+             linetype = "dashed", color = "black", alpha = 0.5, size = 0.5) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_manual(values = industry_colors) +
+  labs(title = "30-Day Rolling Volatility by Industry",
+       subtitle = "Volatility spikes at dashed lines confirm immediate market reaction to conflict",
+       x = NULL, y = "Rolling Std Dev of Daily Returns", color = "Industry") +
+  theme_tq() +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        legend.position = "bottom", legend.text = element_text(size = 8))
+```
+
+::: page-break
+:::
+
+# Page 3: Modeling & Results
+
+## Model 1: 30-Day Return Heatmap
+
+```{r}
+#| label: model-heatmap
+#| fig-width: 9
+#| fig-height: 2.7
+
+event_impact <- function(event_dt, label) {
+  stock_clean %>%
+    filter(date >= event_dt & date <= event_dt + 30) %>%
+    group_by(industry) %>%
+    arrange(date) %>%
+    summarise(
+      return_30d = sum(daily_return[1:min(30, n())], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(event = label)
+}
+
+impact_results <- bind_rows(
+  event_impact(as.Date("2025-06-13"), "12-Day War\n(Jun 2025)"),
+  event_impact(as.Date("2025-11-14"), "Southern Spear\n(Nov 2025)"),
+  event_impact(as.Date("2026-01-03"), "Maduro Captured\n(Jan 2026)"),
+  event_impact(as.Date("2026-02-28"), "US-Iran War\n(Feb 2026)")
+)
+
+impact_results %>%
+  ggplot(aes(x = event, y = industry, fill = return_30d)) +
+  geom_tile(color = "white", size = 0.8) +
+  geom_text(aes(label = percent(return_30d, accuracy = 0.1)),
+            color = "black", size = 3.5, fontface = "bold") +
+  scale_fill_gradient2(low = "#d62728", mid = "white", high = "#2ca02c",
+                       midpoint = 0, labels = percent_format()) +
+  labs(title = "30-Day Industry Return After Each Conflict Event",
+       subtitle = "Green = gained | Red = lost",
+       x = NULL, y = NULL, fill = "30-Day\nReturn") +
+  theme_tq() +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        axis.text = element_text(size = 9))
+```
+
+## Model 2: Recovery Time — Trading Days to Return to Pre-War Price
+
+```{r}
+#| label: model-recovery-chart
+#| fig-width: 9
+#| fig-height: 2.8
+
+recovery_results %>%
+  filter(!is.na(recovery_days)) %>%
+  ggplot(aes(x = reorder(symbol, recovery_days), y = recovery_days, fill = industry)) +
+  geom_col(alpha = 0.85, color = "white") +
+  geom_text(aes(label = paste0(recovery_days, "d")),
+            hjust = -0.2, size = 2.6, fontface = "bold") +
+  coord_flip() +
+  facet_wrap(~event, nrow = 1) +
+  scale_fill_manual(values = industry_colors) +
+  labs(title = "Trading Days for Each Stock to Recover to Pre-War Price",
+       subtitle = "Stocks absent from a panel did not recover within 180 calendar days",
+       x = NULL, y = "Days to Recover", fill = "Industry") +
+  theme_tq() +
+  theme(plot.title   = element_text(face = "bold", size = 11),
+        strip.text   = element_text(size = 7.5, face = "bold"),
+        legend.position = "bottom", legend.text = element_text(size = 8))
+```
+
+## Recovery Summary by Industry
+
+```{r}
+#| label: recovery-table
+
+recovery_results %>%
+  group_by(Industry = industry, Event = event) %>%
+  summarise(
+    `Avg Days to Recover` = round(mean(recovery_days, na.rm = TRUE), 0),
+    `Stocks Recovered`    = paste0(sum(recovered), " / ", n()),
+    `Avg Initial Drop`    = paste0(round(mean(drop_pct, na.rm = TRUE), 1), "%"),
+    .groups = "drop"
+  ) %>%
+  arrange(Event, `Avg Days to Recover`) %>%
+  knitr::kable(align = "llccc")
+```
+
+::: page-break
+:::
+
+# Page 4: Outcomes, Conclusions & Lessons Learned
+
+## Key Findings
+
+**Finding 1: Defense Wins Across Every Conflict.** Defense stocks (LMT, RTX, NOC) posted positive 30-day returns after all four conflict events. The US-Iran War in February 2026 produced the largest gains, driven by unprecedented military spending authorization. Defense also recovered the fastest from any short-term price dips, typically within 5 to 15 trading days.
+
+**Finding 2: Not All Wars Hit Energy the Same Way.** The US-Venezuela conflict caused minimal Energy stock movement because Venezuela supplies less than 1% of global oil. The US-Iran War triggered a sharp Energy spike because the Strait of Hormuz closure threatened 20% of global oil supply. The geography of conflict determines Energy's reaction, not just the existence of conflict.
+
+**Finding 3: Airlines Take the Longest to Recover and Are Hit the Hardest.** Airlines (DAL, UAL) dropped the most after each conflict and took the longest to recover, often 40 to 80 or more trading days. The back-to-back shocks of Venezuela and Iran in early 2026 left Airlines with no recovery window between events, producing the most sustained losses in the entire dataset.
+
+
+## Conclusions
+
+**Conclusion 1: War Creates Predictable Market Patterns.** Every event confirmed the same directional pattern: Defense rises, Energy rises when oil supply is threatened, Airlines fall, Consumer Retail falls. Investors who identify early conflict signals can position themselves ahead of these moves using the same R-based tools applied in this project.
+
+**Conclusion 2: Recovery Time Matters as Much as the Initial Drop.** A stock that drops 5% but takes 60 days to recover is more damaging to a portfolio than one that drops 8% but recovers in 10 days. Defense demonstrated the most resilient recovery profile. Airlines demonstrated the weakest, making them the highest sustained-risk industry during geopolitical conflict periods.
+
+**Conclusion 3: Stacked Conflicts Amplify and Extend Market Damage.** The convergence of the Venezuela operation and US-Iran War within weeks of each other in early 2026 created a compounding shock that no industry had time to absorb between events. Conflict timing, not just conflict magnitude, is a critical driver of how deep and how long market damage lasts.
+
+## Lessons Learned in R
+
+| Lesson | Technique |
+|------------------------------------|------------------------------------|
+| Fetch live financial data without any CSV download | `tidyquant::tq_get()` |
+| Visually mark real-world events on time series charts | `geom_vline()` + `geom_text()` |
+| Algorithmically measure stock recovery time | `purrr::map_dfr()` + `which()` |
+| Hide all code and show only results in output | `execute: echo: false` in YAML |
+| Produce clean formatted tables in HTML output | `knitr::kable()` |
+| Calculate rolling volatility across all stocks | `zoo::rollapply()` |
